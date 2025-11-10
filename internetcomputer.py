@@ -163,11 +163,19 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 @bot.event
 async def on_ready():
-    try:
+   try:
         if GUILD_ID:
             synced = await tree.sync(guild=discord.Object(id=GUILD_ID))
             log.info("Slash commands synced to guild %s (%d).", GUILD_ID, len(synced))
             log.info("Guild commands: %s", [c.name for c in synced])
         else:
             synced = await tree.sync()
-            log.info("Global slash
+            log.info("Global slash commands synced (%d).", len(synced))
+            log.info("Global commands: %s", [c.name for c in synced])
+    except Exception as e:
+        log.exception("Could not sync app commands: %s", e)
+
+    log.info("Logged in as %s (id=%s)", bot.user, bot.user.id)
+
+if __name__ == "__main__":
+    bot.run(DISCORD_TOKEN)
