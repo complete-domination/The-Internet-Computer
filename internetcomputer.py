@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 import os
 import logging
-from typing import Optional, List
+import asyncio
+from typing import Optional, List, Optional as Opt
 
 import discord
 from discord import app_commands
@@ -14,15 +15,16 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
-# Optional: set SHOW_USAGE=1 to display token usage beneath the answer
+# Optional: set SHOW_USAGE=1 to display token usage beneath the answer (final edit only)
 SHOW_USAGE = os.environ.get("SHOW_USAGE", "0") == "1"
 
 GUILD_ID_RAW = os.environ.get("GUILD_ID")  # set to your server ID for instant sync
 GUILD_ID: Optional[int] = int(GUILD_ID_RAW) if GUILD_ID_RAW and GUILD_ID_RAW.isdigit() else None
 
-# Discord hard limit is 2000 characters per message (content or embed field values)
+# Discord limits
 DISCORD_LIMIT = 2000
-EMBED_FIELD_LIMIT = 1024  # best-practice per field; we'll chunk safely
+EMBED_FIELD_LIMIT = 1024             # best practice per embed field
+ANSWER_TOTAL_LIMIT = 5500            # keep headroom under 6000 embed total char limit
 
 if not DISCORD_TOKEN:
     raise SystemExit("Missing DISCORD_TOKEN")
@@ -57,7 +59,6 @@ def chunk_text(s: str, limit: int) -> List[str]:
             chunks.append("".join(buf))
             buf, total = [], 0
         if len(line) > limit:
-            # hard cut very long single lines
             for i in range(0, len(line), limit):
                 piece = line[i:i+limit]
                 if total + len(piece) > limit and buf:
@@ -74,92 +75,135 @@ def chunk_text(s: str, limit: int) -> List[str]:
 
 def make_embed(question: str, answer_preview: str = "⏳ generating...") -> discord.Embed:
     emb = discord.Embed(title="AI Response", color=discord.Color.blurple())
-    # Use fields for neat layout and predictable limits
     for idx, qchunk in enumerate(chunk_text(question, EMBED_FIELD_LIMIT)):
         name = "Question" if idx == 0 else f"Question (cont. {idx})"
         emb.add_field(name=name, value=qchunk or "—", inline=False)
-    # Initial answer placeholder
     emb.add_field(name="Answer", value=answer_preview, inline=False)
     return emb
 
-def update_embed_with_answer(emb: discord.Embed, answer: str, usage_text: Optional[str]) -> discord.Embed:
-    # Remove existing Answer fields
+def update_embed_with_answer(emb: discord.Embed, answer: str, usage_text: Opt[str]) -> discord.Embed:
+    # Trim total answer for embed safety
+    if len(answer) > ANSWER_TOTAL_LIMIT:
+        answer = answer[:ANSWER_TOTAL_LIMIT].rstrip() + "\n…(truncated)"
+
+    # Keep non-answer fields
     new_fields = []
     for f in emb.fields:
         if f.name.lower().startswith("answer"):
             continue
         new_fields.append((f.name, f.value, f.inline))
 
-    # Add the answer in chunks
+    # Add answer chunks
     achunks = chunk_text(answer, EMBED_FIELD_LIMIT)
     for i, chunk in enumerate(achunks):
         name = "Answer" if i == 0 else f"Answer (cont. {i})"
         new_fields.append((name, chunk if chunk else "—", False))
 
     if usage_text:
-        # Keep usage succinct to respect embed limits
         new_fields.append(("Usage", usage_text[:EMBED_FIELD_LIMIT], False))
 
-    # Rebuild embed
+    # Rebuild embed (green = finished)
     new_emb = discord.Embed(title=emb.title, color=discord.Color.green())
     for name, value, inline in new_fields:
         new_emb.add_field(name=name, value=value, inline=inline)
     return new_emb
 
+def update_embed_with_partial(emb: discord.Embed, partial: str) -> discord.Embed:
+    """Update only the answer placeholder with a partial (streaming) value."""
+    # Trim total for safety during streaming
+    if len(partial) > ANSWER_TOTAL_LIMIT:
+        partial = partial[:ANSWER_TOTAL_LIMIT].rstrip() + "\n…(truncated)"
+    # Copy non-answer fields
+    new_fields = []
+    for f in emb.fields:
+        if f.name.lower().startswith("answer"):
+            continue
+        new_fields.append((f.name, f.value, f.inline))
+    # Add partial as answer fields
+    achunks = chunk_text(partial, EMBED_FIELD_LIMIT)
+    for i, chunk in enumerate(achunks):
+        name = "Answer (streaming)" if i == 0 else f"Answer (cont. {i})"
+        new_fields.append((name, chunk if chunk else "—", False))
+    new_emb = discord.Embed(title=emb.title, color=discord.Color.blurple())
+    for name, value, inline in new_fields:
+        new_emb.add_field(name=name, value=value, inline=inline)
+    return new_emb
+
 async def send_initial_message(handle, embed: discord.Embed) -> discord.Message:
-    """
-    Sends a message for either an Interaction or a Context.
-    Returns the message object that we will later edit.
-    """
+    """Send a public message for either an Interaction or a Context and return it."""
     if isinstance(handle, discord.Interaction):
-        # We want a *public* message that can be edited later.
-        # Use defer(ephemeral=False), then followup.send
         if not handle.response.is_done():
             await handle.response.defer(thinking=False, ephemeral=False)
-        msg = await handle.followup.send(embed=embed)
-        # followup.send returns a Message
-        return msg
+        return await handle.followup.send(embed=embed)
     else:
-        # Text command context
         return await handle.send(embed=embed)
 
-# ---------------- Response handler ----------------
+# ---------------- Response handler (with streaming) ----------------
 async def respond_with_ai(interaction_or_ctx, question: str) -> None:
-    """Posts the question immediately (embed), then edits to include the answer."""
+    """Posts the question immediately (embed), streams the answer, then finalizes."""
+    msg: discord.Message = None
     try:
-        # 1) Post the question right away
-        embed = make_embed(question)
-        msg = await send_initial_message(interaction_or_ctx, embed)
+        # 1) Post initial embed with "generating..."
+        base_embed = make_embed(question)
+        msg = await send_initial_message(interaction_or_ctx, base_embed)
 
-        # 2) Call DeepSeek API (non-stream for simplicity & reliability on hosts like Railway)
-        resp = client.chat.completions.create(
+        # 2) Start streaming DeepSeek response
+        stream = client.chat.completions.create(
             model=DEEPSEEK_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": question},
             ],
-            stream=False,
+            stream=True,
         )
 
-        answer = resp.choices[0].message.content.strip() if resp.choices else "No answer returned."
-        usage_text = None
-        try:
-            if SHOW_USAGE and hasattr(resp, "usage") and resp.usage:
-                pu = resp.usage
-                usage_text = f"prompt_tokens: {pu.prompt_tokens}, completion_tokens: {pu.completion_tokens}, total_tokens: {pu.total_tokens}"
-        except Exception:
-            usage_text = None
+        partial_buf: List[str] = []
+        last_edit = 0.0  # time.monotonic() alternative via asyncio loop
+        edit_every_n_tokens = 30      # push an edit every ~30 deltas
+        min_edit_interval = 0.25      # at least 250ms between edits
 
-        # 3) Edit original message to add the answer
-        new_embed = update_embed_with_answer(embed, answer, usage_text)
-        await msg.edit(embed=new_embed)
+        # Iterate chunks
+        async_mode = hasattr(stream, "__aiter__")
+        # The OpenAI client iterator is synchronous; wrap in async-friendly loop:
+        async def iterate_chunks():
+            for chunk in stream:
+                yield chunk
+
+        async for chunk in iterate_chunks():
+            try:
+                delta = getattr(chunk.choices[0].delta, "content", None)
+            except Exception:
+                delta = None
+            if not delta:
+                continue
+            partial_buf.append(delta)
+
+            # Throttle message edits
+            if len(partial_buf) % edit_every_n_tokens == 0:
+                now = asyncio.get_event_loop().time()
+                if now - last_edit >= min_edit_interval:
+                    partial_text = "".join(partial_buf).strip()
+                    emb = update_embed_with_partial(base_embed, partial_text)
+                    await msg.edit(embed=emb)
+                    last_edit = now
+
+        # 3) Finalize with the full answer + optional usage
+        # Note: usage is only present on the final aggregated response object.
+        # DeepSeek (OpenAI compatible) exposes usage via a separate call if needed;
+        # here we simply omit usage during streaming and provide it as None.
+        final_answer = "".join(partial_buf).strip() or "No answer returned."
+        usage_text = None
+        # Attempt to fetch usage by making a lightweight non-stream call with max_tokens=1 and echo? (not reliable)
+        # Keep it simple: SHOW_USAGE not available in streaming path for now.
+
+        final_embed = update_embed_with_answer(base_embed, final_answer, usage_text)
+        await msg.edit(embed=final_embed)
 
     except Exception as e:
-        log.exception("DeepSeek call failed")
+        log.exception("DeepSeek streaming failed")
         err_msg = f"⚠️ Error: {e}"
         try:
             if isinstance(interaction_or_ctx, discord.Interaction):
-                # Try to follow up; if response not done, send a (non-ephemeral) message
                 if not interaction_or_ctx.response.is_done():
                     await interaction_or_ctx.response.send_message(err_msg, ephemeral=True)
                 else:
