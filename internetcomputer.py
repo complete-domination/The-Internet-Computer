@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import asyncio
 import logging
@@ -14,11 +15,12 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 DEEPSEEK_API_BASE = os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 
-GUILD_ID_RAW = os.environ.get("GUILD_ID")  # set this for instant slash registration
+# Set this to your server id to make slash commands show up instantly
+GUILD_ID_RAW = os.environ.get("GUILD_ID")
 GUILD_ID: Optional[int] = int(GUILD_ID_RAW) if GUILD_ID_RAW and GUILD_ID_RAW.isdigit() else None
 
 MAX_DISCORD_REPLY = 1800
-REQUEST_TIMEOUT = 45  # DeepSeek HTTP timeout (s)
+REQUEST_TIMEOUT = 45  # seconds
 
 if not DISCORD_TOKEN:
     raise SystemExit("Missing DISCORD_TOKEN")
@@ -73,13 +75,15 @@ async def call_deepseek(prompt: str) -> str:
 
 # ---------------- Helpers ----------------
 def clamp_discord(text: str) -> str:
-    return text if len(text) <= MAX_DISCORD_REPLY else text[:MAX_DISCORD_REPLY - 20].rstrip() + "\n\n…(truncated)"
+    if len(text) <= MAX_DISCORD_REPLY:
+        return text
+    return text[: MAX_DISCORD_REPLY - 20].rstrip() + "\n\n…(truncated)"
 
-async def respond_with_ai(interaction_or_ctx, question: str):
-    """Handles both slash interactions and legacy prefix messages."""
+async def respond_with_ai(interaction_or_ctx, question: str) -> None:
+    """Works for slash interactions and legacy prefix messages."""
     thinking_msg = None
 
-    # 1) Acknowledge within 3s
+    # 1) Acknowledge the interaction ASAP so Discord never shows "did not respond"
     if isinstance(interaction_or_ctx, discord.Interaction):
         try:
             if not interaction_or_ctx.response.is_done():
@@ -97,7 +101,7 @@ async def respond_with_ai(interaction_or_ctx, question: str):
         except Exception as e:
             log.warning("ctx.reply failed: %s", e)
 
-    # 2) Do the AI call
+    # 2) Call DeepSeek and edit the placeholder
     try:
         answer = await call_deepseek(question)
         answer = clamp_discord(answer)
@@ -122,36 +126,36 @@ async def respond_with_ai(interaction_or_ctx, question: str):
         except Exception as e2:
             log.error("Failed to send error message: %s", e2)
 
-# ---------------- Slash commands (guild-bound if GUILD_ID provided) ----------------
+# ---------------- Slash commands (guild bound if GUILD_ID set) ----------------
 if GUILD_ID:
     GUILD_OBJ = discord.Object(id=GUILD_ID)
 
     @tree.command(name="ask", description="Ask the AI a question and get a reply.", guild=GUILD_OBJ)
     @app_commands.describe(question="Your question or prompt")
-    async def ask_slash(interaction: discord.Interaction, question: str):
+    async def ask_slash(interaction: discord.Interaction, question: str) -> None:
         await respond_with_ai(interaction, question)
 
     @tree.command(name="ping", description="Simple health check.", guild=GUILD_OBJ)
-    async def ping_slash(interaction: discord.Interaction):
+    async def ping_slash(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("pong 🏓", ephemeral=True)
 else:
     @tree.command(name="ask", description="Ask the AI a question and get a reply.")
     @app_commands.describe(question="Your question or prompt")
-    async def ask_slash(interaction: discord.Interaction, question: str):
+    async def ask_slash(interaction: discord.Interaction, question: str) -> None:
         await respond_with_ai(interaction, question)
 
     @tree.command(name="ping", description="Simple health check.")
-    async def ping_slash(interaction: discord.Interaction):
+    async def ping_slash(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("pong 🏓", ephemeral=True)
 
-# Legacy prefix command
+# Legacy prefix command for backup
 @bot.command(name="ask")
-async def ask_legacy(ctx: commands.Context, *, question: str):
+async def ask_legacy(ctx: commands.Context, *, question: str) -> None:
     await respond_with_ai(ctx, question)
 
-# Global app command error surfacing
+# Surface app_command errors in logs and to the user
 @tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
     log.exception("App command error: %s", error)
     try:
         if not interaction.response.is_done():
@@ -162,8 +166,8 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         pass
 
 @bot.event
-async def on_ready():
-   try:
+async def on_ready() -> None:
+    try:
         if GUILD_ID:
             synced = await tree.sync(guild=discord.Object(id=GUILD_ID))
             log.info("Slash commands synced to guild %s (%d).", GUILD_ID, len(synced))
