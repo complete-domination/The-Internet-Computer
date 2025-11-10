@@ -127,62 +127,56 @@ async def respond_with_ai(interaction_or_ctx, question: str):
             log.error("Failed to send error message: %s", e2)
 
 # ---------------- Commands ----------------
-def register_commands():
+# Build once, then register with or without a guild binding.
+from discord import app_commands
+
+if GUILD_ID:
+    GUILD_OBJ = discord.Object(id=GUILD_ID)
+
+    @tree.command(
+        name="ask",
+        description="Ask the AI a question and get a reply.",
+        guild=GUILD_OBJ,
+    )
     @app_commands.describe(question="Your question or prompt")
-    async def ask_cmd(interaction: discord.Interaction, question: str):
+    async def ask_slash(interaction: discord.Interaction, question: str):
         await respond_with_ai(interaction, question)
 
-    @app_commands.command(name="ping", description="Simple health check.")
-    async def ping_cmd(interaction: discord.Interaction):
-        # Immediate response to test slash plumbing
+    @tree.command(
+        name="ping",
+        description="Simple health check.",
+        guild=GUILD_OBJ,
+    )
+    async def ping_slash(interaction: discord.Interaction):
         await interaction.response.send_message("pong 🏓", ephemeral=True)
 
-    if GUILD_ID:
-        guild_obj = discord.Object(id=GUILD_ID)
-        tree.add_command(app_commands.Command(
-            name="ask",
-            description="Ask the AI a question and get a reply.",
-            callback=ask_cmd
-        ), guild=guild_obj)
-        tree.add_command(ping_cmd, guild=guild_obj)
-    else:
-        tree.add_command(app_commands.Command(
-            name="ask",
-            description="Ask the AI a question and get a reply.",
-            callback=ask_cmd
-        ))
-        tree.add_command(ping_cmd)
+else:
+    @tree.command(name="ask", description="Ask the AI a question and get a reply.")
+    @app_commands.describe(question="Your question or prompt")
+    async def ask_slash(interaction: discord.Interaction, question: str):
+        await respond_with_ai(interaction, question)
+
+    @tree.command(name="ping", description="Simple health check.")
+    async def ping_slash(interaction: discord.Interaction):
+        await interaction.response.send_message("pong 🏓", ephemeral=True)
 
 @bot.command(name="ask")
 async def ask_legacy(ctx: commands.Context, *, question: str):
     await respond_with_ai(ctx, question)
 
-@tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    # Surface unexpected errors in logs and to the user (ephemeral)
-    log.exception("App command error: %s", error)
-    try:
-        if not interaction.response.is_done():
-            await interaction.response.send_message(f"⚠️ Command error: {error}", ephemeral=True)
-        else:
-            await interaction.followup.send(f"⚠️ Command error: {error}", ephemeral=True)
-    except Exception:
-        pass
-
 @bot.event
 async def on_ready():
     try:
-        register_commands()
+        # Force a fresh sync every boot.
         if GUILD_ID:
-            guild_obj = discord.Object(id=GUILD_ID)
-            synced = await tree.sync(guild=guild_obj)
+            synced = await tree.sync(guild=discord.Object(id=GUILD_ID))
             log.info("Slash commands synced to guild %s (%d).", GUILD_ID, len(synced))
+            log.info("Guild commands: %s", [c.name for c in synced])
         else:
             synced = await tree.sync()
             log.info("Global slash commands synced (%d).", len(synced))
+            log.info("Global commands: %s", [c.name for c in synced])
     except Exception as e:
-        log.warning("Could not sync app commands: %s", e)
-    log.info("Logged in as %s (id=%s)", bot.user, bot.user.id)
+        log.exception("Could not sync app commands: %s", e)
 
-if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN)
+    log.info("Logged in as %s (id=%s)", bot.user, bot.user.id)
