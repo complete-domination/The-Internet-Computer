@@ -15,20 +15,16 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
-# Optional usage line (streaming usage is generally unavailable)
+# Optional: set SHOW_USAGE=1 to display token usage beneath the answer (final edit only)
 SHOW_USAGE = os.environ.get("SHOW_USAGE", "0") == "1"
 
-# Smooth typing controls
-CHAR_RATE_MS = int(os.environ.get("CHAR_RATE_MS", "140"))       # cadence of edits
-CHARS_PER_TICK = int(os.environ.get("CHARS_PER_TICK", "40"))    # chars revealed per tick
-
-GUILD_ID_RAW = os.environ.get("GUILD_ID")
+GUILD_ID_RAW = os.environ.get("GUILD_ID")  # set to your server ID for instant sync
 GUILD_ID: Optional[int] = int(GUILD_ID_RAW) if GUILD_ID_RAW and GUILD_ID_RAW.isdigit() else None
 
-# Discord/Embed limits
+# Discord limits
 DISCORD_LIMIT = 2000
-EMBED_FIELD_LIMIT = 1024
-ANSWER_TOTAL_LIMIT = 5500
+EMBED_FIELD_LIMIT = 1024             # best practice per embed field
+ANSWER_TOTAL_LIMIT = 5500            # keep headroom under 6000 embed total char limit
 
 if not DISCORD_TOKEN:
     raise SystemExit("Missing DISCORD_TOKEN")
@@ -52,23 +48,27 @@ SYSTEM_PROMPT = (
     "Keep answers under 6 paragraphs unless asked for more detail."
 )
 
-# ---------------- Helpers ----------------
 def chunk_text(s: str, limit: int) -> List[str]:
+    """Split text into chunks <= limit, on line boundaries when possible."""
     if len(s) <= limit:
         return [s]
     chunks, buf = [], []
     total = 0
     for line in s.splitlines(keepends=True):
         if total + len(line) > limit and buf:
-            chunks.append("".join(buf)); buf, total = [], 0
+            chunks.append("".join(buf))
+            buf, total = [], 0
         if len(line) > limit:
             for i in range(0, len(line), limit):
                 piece = line[i:i+limit]
                 if total + len(piece) > limit and buf:
-                    chunks.append("".join(buf)); buf, total = [], 0
-                buf.append(piece); total += len(piece)
+                    chunks.append("".join(buf))
+                    buf, total = [], 0
+                buf.append(piece)
+                total += len(piece)
         else:
-            buf.append(line); total += len(line)
+            buf.append(line)
+            total += len(line)
     if buf:
         chunks.append("".join(buf))
     return [c.strip("\n") for c in chunks if c]
@@ -82,15 +82,18 @@ def make_embed(question: str, answer_preview: str = "⏳ generating...") -> disc
     return emb
 
 def update_embed_with_answer(emb: discord.Embed, answer: str, usage_text: Opt[str]) -> discord.Embed:
+    # Trim total answer for embed safety
     if len(answer) > ANSWER_TOTAL_LIMIT:
         answer = answer[:ANSWER_TOTAL_LIMIT].rstrip() + "\n…(truncated)"
 
+    # Keep non-answer fields
     new_fields = []
     for f in emb.fields:
         if f.name.lower().startswith("answer"):
             continue
         new_fields.append((f.name, f.value, f.inline))
 
+    # Add answer chunks
     achunks = chunk_text(answer, EMBED_FIELD_LIMIT)
     for i, chunk in enumerate(achunks):
         name = "Answer" if i == 0 else f"Answer (cont. {i})"
@@ -99,34 +102,35 @@ def update_embed_with_answer(emb: discord.Embed, answer: str, usage_text: Opt[st
     if usage_text:
         new_fields.append(("Usage", usage_text[:EMBED_FIELD_LIMIT], False))
 
+    # Rebuild embed (green = finished)
     new_emb = discord.Embed(title=emb.title, color=discord.Color.green())
     for name, value, inline in new_fields:
         new_emb.add_field(name=name, value=value, inline=inline)
     return new_emb
 
-def update_embed_with_partial(emb: discord.Embed, partial: str, show_cursor: bool = True) -> discord.Embed:
+def update_embed_with_partial(emb: discord.Embed, partial: str) -> discord.Embed:
+    """Update only the answer placeholder with a partial (streaming) value."""
+    # Trim total for safety during streaming
     if len(partial) > ANSWER_TOTAL_LIMIT:
         partial = partial[:ANSWER_TOTAL_LIMIT].rstrip() + "\n…(truncated)"
-    if show_cursor:
-        partial = (partial + " ▋").rstrip()
-
+    # Copy non-answer fields
     new_fields = []
     for f in emb.fields:
         if f.name.lower().startswith("answer"):
             continue
         new_fields.append((f.name, f.value, f.inline))
-
+    # Add partial as answer fields
     achunks = chunk_text(partial, EMBED_FIELD_LIMIT)
     for i, chunk in enumerate(achunks):
         name = "Answer (streaming)" if i == 0 else f"Answer (cont. {i})"
         new_fields.append((name, chunk if chunk else "—", False))
-
     new_emb = discord.Embed(title=emb.title, color=discord.Color.blurple())
     for name, value, inline in new_fields:
         new_emb.add_field(name=name, value=value, inline=inline)
     return new_emb
 
 async def send_initial_message(handle, embed: discord.Embed) -> discord.Message:
+    """Send a public message for either an Interaction or a Context and return it."""
     if isinstance(handle, discord.Interaction):
         if not handle.response.is_done():
             await handle.response.defer(thinking=False, ephemeral=False)
@@ -134,140 +138,64 @@ async def send_initial_message(handle, embed: discord.Embed) -> discord.Message:
     else:
         return await handle.send(embed=embed)
 
-# ---------------- Smooth streaming machinery ----------------
-# We use a queue to transfer streamed deltas from a background thread to the asyncio loop.
-SENTINEL = object()
-
-async def smooth_typing_display(
-    msg: discord.Message,
-    base_embed: discord.Embed,
-    q: asyncio.Queue,
-) -> str:
-    """
-    Consume text deltas from the queue and reveal them as smooth 'typing'.
-    Returns the final full text.
-    """
-    assembled: List[str] = []
-    shown_len = 0
-    done = False
-
-    async def keep_typing(ch):
-        # Native Discord typing indicator
-        while not done:
-            try: await ch.trigger_typing()
-            except Exception: pass
-            await asyncio.sleep(7)
-
-    typing_task = None
-    if msg.channel is not None:
-        typing_task = asyncio.create_task(keep_typing(msg.channel))
-
-    try:
-        while True:
-            # Drain any available items without blocking
-            drained = False
-            while True:
-                try:
-                    item = q.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                drained = True
-                if item is SENTINEL:
-                    done = True
-                else:
-                    assembled.append(item)
-
-            # If nothing new arrived and we're not done yet, still tick for typing feel
-            current = "".join(assembled)
-
-            # Reveal a little more each tick
-            target_len = min(len(current), shown_len + CHARS_PER_TICK)
-            if target_len > shown_len:
-                # tiny pause after punctuation looks natural
-                if target_len < len(current):
-                    peek = current[target_len - 1:target_len]
-                    if peek in ".?!,;:":
-                        await asyncio.sleep(0.08)
-                partial = current[:target_len]
-                emb = update_embed_with_partial(base_embed, partial, show_cursor=not done)
-                try:
-                    await msg.edit(embed=emb)
-                except Exception:
-                    pass
-                shown_len = target_len
-
-            if done and shown_len >= len(current):
-                # fully displayed and producer is finished
-                return current
-
-            # sleep for cadence
-            await asyncio.sleep(CHAR_RATE_MS / 1000.0)
-    finally:
-        if typing_task:
-            typing_task.cancel()
-
-def _produce_stream_sync(model: str, system_prompt: str, question: str, put_func) -> None:
-    """
-    Blocking producer that reads the DeepSeek stream and pushes deltas via put_func.
-    Runs in a background thread using asyncio.to_thread.
-    """
-    stream = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": question},
-        ],
-        stream=True,
-    )
-    try:
-        for chunk in stream:
-            try:
-                delta = getattr(chunk.choices[0].delta, "content", None)
-            except Exception:
-                delta = None
-            if delta:
-                put_func(delta)
-    finally:
-        # indicate completion
-        put_func(SENTINEL)
-
-# ---------------- Response handler (smooth streaming) ----------------
+# ---------------- Response handler (with streaming) ----------------
 async def respond_with_ai(interaction_or_ctx, question: str) -> None:
-    """Posts the question immediately (embed), streams with smooth typing, then finalizes."""
+    """Posts the question immediately (embed), streams the answer, then finalizes."""
+    msg: discord.Message = None
     try:
         # 1) Post initial embed with "generating..."
         base_embed = make_embed(question)
         msg = await send_initial_message(interaction_or_ctx, base_embed)
 
-        # 2) Create a queue for deltas and start the blocking producer in a thread
-        q: asyncio.Queue = asyncio.Queue()
-
-        def put_now(item):
-            try:
-                # thread-safe: put_nowait is safe because Queue is thread-safe under asyncio when using loop-safe methods via call_soon_threadsafe,
-                # but to be fully safe we use loop.call_soon_threadsafe to schedule a coroutine-friendly put_nowait.
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                # if no loop, just ignore (shouldn't happen)
-                return
-            loop.call_soon_threadsafe(q.put_nowait, item)
-
-        producer_task = asyncio.create_task(
-            asyncio.to_thread(_produce_stream_sync, DEEPSEEK_MODEL, SYSTEM_PROMPT, question, put_now)
+        # 2) Start streaming DeepSeek response
+        stream = client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": question},
+            ],
+            stream=True,
         )
 
-        # 3) Display smooth typing while the producer feeds deltas
-        final_text = await smooth_typing_display(msg, base_embed, q)
+        partial_buf: List[str] = []
+        last_edit = 0.0  # time.monotonic() alternative via asyncio loop
+        edit_every_n_tokens = 30      # push an edit every ~30 deltas
+        min_edit_interval = 0.25      # at least 250ms between edits
 
-        # Ensure producer done (capture errors if any)
-        try:
-            await producer_task
-        except Exception as pe:
-            log.exception("Producer thread failed: %s", pe)
+        # Iterate chunks
+        async_mode = hasattr(stream, "__aiter__")
+        # The OpenAI client iterator is synchronous; wrap in async-friendly loop:
+        async def iterate_chunks():
+            for chunk in stream:
+                yield chunk
 
-        # 4) Finalize with full answer (green embed)
-        final_answer = final_text.strip() or "No answer returned."
-        usage_text = None  # usage typically not provided in streaming mode
+        async for chunk in iterate_chunks():
+            try:
+                delta = getattr(chunk.choices[0].delta, "content", None)
+            except Exception:
+                delta = None
+            if not delta:
+                continue
+            partial_buf.append(delta)
+
+            # Throttle message edits
+            if len(partial_buf) % edit_every_n_tokens == 0:
+                now = asyncio.get_event_loop().time()
+                if now - last_edit >= min_edit_interval:
+                    partial_text = "".join(partial_buf).strip()
+                    emb = update_embed_with_partial(base_embed, partial_text)
+                    await msg.edit(embed=emb)
+                    last_edit = now
+
+        # 3) Finalize with the full answer + optional usage
+        # Note: usage is only present on the final aggregated response object.
+        # DeepSeek (OpenAI compatible) exposes usage via a separate call if needed;
+        # here we simply omit usage during streaming and provide it as None.
+        final_answer = "".join(partial_buf).strip() or "No answer returned."
+        usage_text = None
+        # Attempt to fetch usage by making a lightweight non-stream call with max_tokens=1 and echo? (not reliable)
+        # Keep it simple: SHOW_USAGE not available in streaming path for now.
+
         final_embed = update_embed_with_answer(base_embed, final_answer, usage_text)
         await msg.edit(embed=final_embed)
 
@@ -316,6 +244,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @bot.event
 async def on_ready() -> None:
     try:
+        # Sync globally and, if provided, to a specific guild for instant availability
         if GUILD_ID:
             guild_obj = discord.Object(id=GUILD_ID)
             tree.copy_global_to(guild=guild_obj)
