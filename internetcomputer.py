@@ -6,17 +6,15 @@ from typing import Optional
 import discord
 from discord import app_commands
 from discord.ext import commands
-
 from openai import OpenAI
 
-# ---------------- Config ----------------
+# ---------------- Configuration ----------------
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
-# Set this to your server id for instant guild sync (recommended)
-GUILD_ID_RAW = os.environ.get("GUILD_ID")
+GUILD_ID_RAW = os.environ.get("GUILD_ID")  # set to your server ID for instant sync
 GUILD_ID: Optional[int] = int(GUILD_ID_RAW) if GUILD_ID_RAW and GUILD_ID_RAW.isdigit() else None
 
 MAX_DISCORD_REPLY = 1800
@@ -34,7 +32,7 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# ---------------- DeepSeek client (OpenAI SDK) ----------------
+# ---------------- DeepSeek client ----------------
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
 SYSTEM_PROMPT = (
@@ -44,30 +42,23 @@ SYSTEM_PROMPT = (
 )
 
 def clamp_discord(text: str) -> str:
-    return text if len(text) <= MAX_DISCORD_REPLY else text[: MAX_DISCORD_REPLY - 20].rstrip() + "\n\n…(truncated)"
+    """Avoid exceeding Discord's message length limit."""
+    return text if len(text) <= MAX_DISCORD_REPLY else text[:MAX_DISCORD_REPLY - 20].rstrip() + "\n\n…(truncated)"
 
+# ---------------- Response handler ----------------
 async def respond_with_ai(interaction_or_ctx, question: str) -> None:
-    """Handles both slash interactions and legacy prefix messages."""
-    thinking_msg = None
-
-    if isinstance(interaction_or_ctx, discord.Interaction):
-        # Always ack within 3s
-        try:
-            if not interaction_or_ctx.response.is_done():
-                await interaction_or_ctx.response.defer(thinking=True)
-        except Exception as e:
-            log.warning("Defer failed: %s", e)
-        try:
-            thinking_msg = await interaction_or_ctx.followup.send("🤖 Thinking…")
-        except Exception as e:
-            log.warning("followup.send failed: %s", e)
-    else:
-        try:
-            thinking_msg = await interaction_or_ctx.reply("🤖 Thinking…")
-        except Exception as e:
-            log.warning("ctx.reply failed: %s", e)
-
+    """Posts the question first, then edits to include the answer."""
     try:
+        header = f"**🧠 Question:** {question}"
+
+        # Post the question publicly right away
+        if isinstance(interaction_or_ctx, discord.Interaction):
+            await interaction_or_ctx.response.defer(thinking=False)
+            msg = await interaction_or_ctx.followup.send(header)
+        else:
+            msg = await interaction_or_ctx.send(header)
+
+        # Call DeepSeek API
         resp = client.chat.completions.create(
             model=DEEPSEEK_MODEL,
             messages=[
@@ -76,30 +67,25 @@ async def respond_with_ai(interaction_or_ctx, question: str) -> None:
             ],
             stream=False,
         )
+
         answer = resp.choices[0].message.content.strip()
         answer = clamp_discord(answer)
-        if thinking_msg:
-            await thinking_msg.edit(content=answer)
-        else:
-            if isinstance(interaction_or_ctx, discord.Interaction):
-                await interaction_or_ctx.followup.send(answer)
-            else:
-                await interaction_or_ctx.send(answer)
+
+        # Edit the same message with the AI’s reply appended
+        await msg.edit(content=f"{header}\n\n**💬 Answer:** {answer}")
+
     except Exception as e:
-        err = f"⚠️ Error: {e}"
+        err_msg = f"⚠️ Error: {e}"
         log.exception("DeepSeek call failed")
         try:
-            if thinking_msg:
-                await thinking_msg.edit(content=err)
+            if isinstance(interaction_or_ctx, discord.Interaction):
+                await interaction_or_ctx.followup.send(err_msg)
             else:
-                if isinstance(interaction_or_ctx, discord.Interaction):
-                    await interaction_or_ctx.followup.send(err, ephemeral=True)
-                else:
-                    await interaction_or_ctx.send(err)
+                await interaction_or_ctx.send(err_msg)
         except Exception:
             pass
 
-# ---------------- Slash commands (REGISTERED GLOBALLY) ----------------
+# ---------------- Slash Commands ----------------
 @tree.command(name="ask", description="Ask the AI a question and get a reply.")
 @app_commands.describe(question="Your question or prompt")
 async def ask_slash(interaction: discord.Interaction, question: str) -> None:
@@ -109,12 +95,12 @@ async def ask_slash(interaction: discord.Interaction, question: str) -> None:
 async def ping_slash(interaction: discord.Interaction) -> None:
     await interaction.response.send_message("pong 🏓", ephemeral=True)
 
-# Legacy prefix command for backup
+# Legacy prefix command
 @bot.command(name="ask")
 async def ask_legacy(ctx: commands.Context, *, question: str) -> None:
     await respond_with_ai(ctx, question)
 
-# Surface app command errors nicely
+# Error handling for slash commands
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
     log.exception("App command error: %s", error)
@@ -126,19 +112,18 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     except Exception:
         pass
 
+# ---------------- On Ready ----------------
 @bot.event
 async def on_ready() -> None:
     try:
-        # 1) If a guild is provided, sync there first (instant)
+        # Always sync globally, and also to the guild if specified
         if GUILD_ID:
             guild_obj = discord.Object(id=GUILD_ID)
-            # ensure global commands are copied to guild, then sync
             tree.copy_global_to(guild=guild_obj)
             guild_synced = await tree.sync(guild=guild_obj)
             log.info("Guild slash commands synced to %s (%d).", GUILD_ID, len(guild_synced))
             log.info("Guild commands now: %s", [c.name for c in guild_synced])
 
-        # 2) Also sync global (helps if you use the bot elsewhere)
         global_synced = await tree.sync()
         log.info("Global slash commands synced (%d).", len(global_synced))
         log.info("Global commands now: %s", [c.name for c in global_synced])
