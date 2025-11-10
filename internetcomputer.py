@@ -14,11 +14,11 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 DEEPSEEK_API_BASE = os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 
-GUILD_ID_RAW = os.environ.get("GUILD_ID")
+GUILD_ID_RAW = os.environ.get("GUILD_ID")  # set this for instant slash registration
 GUILD_ID: Optional[int] = int(GUILD_ID_RAW) if GUILD_ID_RAW and GUILD_ID_RAW.isdigit() else None
 
 MAX_DISCORD_REPLY = 1800
-REQUEST_TIMEOUT = 45  # HTTP timeout to DeepSeek
+REQUEST_TIMEOUT = 45  # DeepSeek HTTP timeout (s)
 
 if not DISCORD_TOKEN:
     raise SystemExit("Missing DISCORD_TOKEN")
@@ -79,7 +79,7 @@ async def respond_with_ai(interaction_or_ctx, question: str):
     """Handles both slash interactions and legacy prefix messages."""
     thinking_msg = None
 
-    # 1) ALWAYS ack the interaction within 3s
+    # 1) Acknowledge within 3s
     if isinstance(interaction_or_ctx, discord.Interaction):
         try:
             if not interaction_or_ctx.response.is_done():
@@ -87,27 +87,23 @@ async def respond_with_ai(interaction_or_ctx, question: str):
         except Exception as e:
             log.warning("Defer failed: %s", e)
 
-        # 2) Create the editable 'Thinking…' message ASAP
         try:
             thinking_msg = await interaction_or_ctx.followup.send("🤖 Thinking…")
         except Exception as e:
-            log.warning("followup.send failed (can be perms/channel): %s", e)
-
+            log.warning("followup.send failed: %s", e)
     else:
-        # Legacy prefix
         try:
             thinking_msg = await interaction_or_ctx.reply("🤖 Thinking…")
         except Exception as e:
             log.warning("ctx.reply failed: %s", e)
 
-    # 3) Do the AI call
+    # 2) Do the AI call
     try:
         answer = await call_deepseek(question)
         answer = clamp_discord(answer)
         if thinking_msg:
             await thinking_msg.edit(content=answer)
         else:
-            # Fallback if we couldn't create the placeholder
             if isinstance(interaction_or_ctx, discord.Interaction):
                 await interaction_or_ctx.followup.send(answer)
             else:
@@ -126,30 +122,18 @@ async def respond_with_ai(interaction_or_ctx, question: str):
         except Exception as e2:
             log.error("Failed to send error message: %s", e2)
 
-# ---------------- Commands ----------------
-# Build once, then register with or without a guild binding.
-from discord import app_commands
-
+# ---------------- Slash commands (guild-bound if GUILD_ID provided) ----------------
 if GUILD_ID:
     GUILD_OBJ = discord.Object(id=GUILD_ID)
 
-    @tree.command(
-        name="ask",
-        description="Ask the AI a question and get a reply.",
-        guild=GUILD_OBJ,
-    )
+    @tree.command(name="ask", description="Ask the AI a question and get a reply.", guild=GUILD_OBJ)
     @app_commands.describe(question="Your question or prompt")
     async def ask_slash(interaction: discord.Interaction, question: str):
         await respond_with_ai(interaction, question)
 
-    @tree.command(
-        name="ping",
-        description="Simple health check.",
-        guild=GUILD_OBJ,
-    )
+    @tree.command(name="ping", description="Simple health check.", guild=GUILD_OBJ)
     async def ping_slash(interaction: discord.Interaction):
         await interaction.response.send_message("pong 🏓", ephemeral=True)
-
 else:
     @tree.command(name="ask", description="Ask the AI a question and get a reply.")
     @app_commands.describe(question="Your question or prompt")
@@ -160,23 +144,30 @@ else:
     async def ping_slash(interaction: discord.Interaction):
         await interaction.response.send_message("pong 🏓", ephemeral=True)
 
+# Legacy prefix command
 @bot.command(name="ask")
 async def ask_legacy(ctx: commands.Context, *, question: str):
     await respond_with_ai(ctx, question)
 
+# Global app command error surfacing
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    log.exception("App command error: %s", error)
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(f"⚠️ Command error: {error}", ephemeral=True)
+        else:
+            await interaction.followup.send(f"⚠️ Command error: {error}", ephemeral=True)
+    except Exception:
+        pass
+
 @bot.event
 async def on_ready():
     try:
-        # Force a fresh sync every boot.
         if GUILD_ID:
             synced = await tree.sync(guild=discord.Object(id=GUILD_ID))
             log.info("Slash commands synced to guild %s (%d).", GUILD_ID, len(synced))
             log.info("Guild commands: %s", [c.name for c in synced])
         else:
             synced = await tree.sync()
-            log.info("Global slash commands synced (%d).", len(synced))
-            log.info("Global commands: %s", [c.name for c in synced])
-    except Exception as e:
-        log.exception("Could not sync app commands: %s", e)
-
-    log.info("Logged in as %s (id=%s)", bot.user, bot.user.id)
+            log.info("Global slash
