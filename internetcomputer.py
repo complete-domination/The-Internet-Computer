@@ -1,26 +1,25 @@
 # -*- coding: utf-8 -*-
 import os
-import asyncio
 import logging
 from typing import Optional
 
-import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+from openai import OpenAI
+
 # ---------------- Config ----------------
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+# DeepSeek's docs use base_url WITHOUT /v1
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
-DEEPSEEK_API_BASE = os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 
-# Set this to your server id to make slash commands show up instantly
-GUILD_ID_RAW = os.environ.get("GUILD_ID")
+GUILD_ID_RAW = os.environ.get("GUILD_ID")  # set for instant guild slash registration
 GUILD_ID: Optional[int] = int(GUILD_ID_RAW) if GUILD_ID_RAW and GUILD_ID_RAW.isdigit() else None
 
 MAX_DISCORD_REPLY = 1800
-REQUEST_TIMEOUT = 45  # seconds
 
 if not DISCORD_TOKEN:
     raise SystemExit("Missing DISCORD_TOKEN")
@@ -35,62 +34,30 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# ---------------- DeepSeek call ----------------
+# ---------------- DeepSeek client (OpenAI SDK) ----------------
+# We initialize one client and reuse it.
+client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+
 SYSTEM_PROMPT = (
     "You are a concise, helpful assistant. Answer clearly. "
     "If the user asks for code, provide minimal runnable examples. "
     "Keep answers under 6 paragraphs unless asked for more detail."
 )
 
-async def call_deepseek(prompt: str) -> str:
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": DEEPSEEK_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        "stream": False,
-    }
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(
-                f"{DEEPSEEK_API_BASE}/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=REQUEST_TIMEOUT,
-            ) as resp:
-                body = await resp.text()
-                if resp.status != 200:
-                    raise RuntimeError(f"DeepSeek API error {resp.status}: {body[:300]}")
-                data = await resp.json()
-                return data["choices"][0]["message"]["content"].strip()
-        except asyncio.TimeoutError:
-            raise RuntimeError("DeepSeek request timed out.")
-        except Exception as e:
-            raise RuntimeError(f"DeepSeek exception: {e}")
-
-# ---------------- Helpers ----------------
 def clamp_discord(text: str) -> str:
-    if len(text) <= MAX_DISCORD_REPLY:
-        return text
-    return text[: MAX_DISCORD_REPLY - 20].rstrip() + "\n\n…(truncated)"
+    return text if len(text) <= MAX_DISCORD_REPLY else text[: MAX_DISCORD_REPLY - 20].rstrip() + "\n\n…(truncated)"
 
 async def respond_with_ai(interaction_or_ctx, question: str) -> None:
     """Works for slash interactions and legacy prefix messages."""
     thinking_msg = None
 
-    # 1) Acknowledge the interaction ASAP so Discord never shows "did not respond"
+    # 1) Ack ASAP so Discord never shows 'did not respond'
     if isinstance(interaction_or_ctx, discord.Interaction):
         try:
             if not interaction_or_ctx.response.is_done():
                 await interaction_or_ctx.response.defer(thinking=True)
         except Exception as e:
             log.warning("Defer failed: %s", e)
-
         try:
             thinking_msg = await interaction_or_ctx.followup.send("🤖 Thinking…")
         except Exception as e:
@@ -101,9 +68,19 @@ async def respond_with_ai(interaction_or_ctx, question: str) -> None:
         except Exception as e:
             log.warning("ctx.reply failed: %s", e)
 
-    # 2) Call DeepSeek and edit the placeholder
+    # 2) Call DeepSeek via OpenAI SDK (non-stream, as per docs)
     try:
-        answer = await call_deepseek(question)
+        # If you want a request timeout, you can do:
+        # resp = client.with_options(timeout=45).chat.completions.create(...)
+        resp = client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": question},
+            ],
+            stream=False,
+        )
+        answer = resp.choices[0].message.content.strip()
         answer = clamp_discord(answer)
         if thinking_msg:
             await thinking_msg.edit(content=answer)
@@ -114,7 +91,7 @@ async def respond_with_ai(interaction_or_ctx, question: str) -> None:
                 await interaction_or_ctx.send(answer)
     except Exception as e:
         err = f"⚠️ Error: {e}"
-        log.error("AI error: %s", e)
+        log.exception("DeepSeek call failed")
         try:
             if thinking_msg:
                 await thinking_msg.edit(content=err)
@@ -123,10 +100,10 @@ async def respond_with_ai(interaction_or_ctx, question: str) -> None:
                     await interaction_or_ctx.followup.send(err, ephemeral=True)
                 else:
                     await interaction_or_ctx.send(err)
-        except Exception as e2:
-            log.error("Failed to send error message: %s", e2)
+        except Exception:
+            pass
 
-# ---------------- Slash commands (guild bound if GUILD_ID set) ----------------
+# ---------------- Slash commands (guild-bound if GUILD_ID set) ----------------
 if GUILD_ID:
     GUILD_OBJ = discord.Object(id=GUILD_ID)
 
@@ -148,12 +125,12 @@ else:
     async def ping_slash(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("pong 🏓", ephemeral=True)
 
-# Legacy prefix command for backup
+# Legacy prefix command
 @bot.command(name="ask")
 async def ask_legacy(ctx: commands.Context, *, question: str) -> None:
     await respond_with_ai(ctx, question)
 
-# Surface app_command errors in logs and to the user
+# Surface app command errors
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
     log.exception("App command error: %s", error)
