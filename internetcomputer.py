@@ -2,7 +2,7 @@
 import os
 import logging
 import asyncio
-from typing import Optional, List, Optional as Opt
+from typing import Optional, List, Optional as Opt, Tuple
 
 import discord
 from discord import app_commands
@@ -46,6 +46,24 @@ SYSTEM_PROMPT = (
     "Keep answers under 6 paragraphs unless asked for more detail."
 )
 
+# ---------------- Helpers ----------------
+def get_asker_identity(src) -> Tuple[str, Optional[str]]:
+    """Return display name and avatar URL of asker."""
+    user = None
+    if isinstance(src, discord.Interaction):
+        user = src.user
+    elif hasattr(src, "author"):
+        user = getattr(src, "author", None)
+    name = "Unknown User"
+    avatar_url = None
+    if user:
+        name = getattr(user, "display_name", None) or getattr(user, "name", "Unknown User")
+        try:
+            avatar_url = str(user.display_avatar.url)
+        except Exception:
+            avatar_url = None
+    return name, avatar_url
+
 def chunk_text(s: str, limit: int) -> List[str]:
     if len(s) <= limit:
         return [s]
@@ -70,9 +88,14 @@ def chunk_text(s: str, limit: int) -> List[str]:
         chunks.append("".join(buf))
     return [c.strip("\n") for c in chunks if c]
 
-def make_embed(question: str, answer_preview: str = "⏳ generating...") -> discord.Embed:
-    # removed title="AI Response" only
+def make_embed(question: str, asker_name: str, asker_avatar: Optional[str], answer_preview: str = "⏳ generating...") -> discord.Embed:
     emb = discord.Embed(color=discord.Color.blurple())
+    # Re-added: show asker name and avatar in header
+    try:
+        emb.set_author(name=f"{asker_name} asked", icon_url=asker_avatar if asker_avatar else discord.Embed.Empty)
+    except Exception:
+        emb.set_author(name=f"{asker_name} asked")
+
     for idx, qchunk in enumerate(chunk_text(question, EMBED_FIELD_LIMIT)):
         name = "Question" if idx == 0 else f"Question (cont. {idx})"
         emb.add_field(name=name, value=qchunk or "—", inline=False)
@@ -93,7 +116,10 @@ def update_embed_with_answer(emb: discord.Embed, answer: str, usage_text: Opt[st
         new_fields.append((name, chunk if chunk else "—", False))
     if usage_text:
         new_fields.append(("Usage", usage_text[:EMBED_FIELD_LIMIT], False))
-    new_emb = discord.Embed(color=discord.Color.green())  # no title
+    new_emb = discord.Embed(color=discord.Color.green())
+    # preserve author name & avatar
+    if emb.author and emb.author.name:
+        new_emb.set_author(name=emb.author.name, icon_url=emb.author.icon_url)
     for name, value, inline in new_fields:
         new_emb.add_field(name=name, value=value, inline=inline)
     return new_emb
@@ -110,7 +136,10 @@ def update_embed_with_partial(emb: discord.Embed, partial: str) -> discord.Embed
     for i, chunk in enumerate(achunks):
         name = "Answer (streaming)" if i == 0 else f"Answer (cont. {i})"
         new_fields.append((name, chunk if chunk else "—", False))
-    new_emb = discord.Embed(color=discord.Color.blurple())  # no title
+    new_emb = discord.Embed(color=discord.Color.blurple())
+    # preserve author name & avatar
+    if emb.author and emb.author.name:
+        new_emb.set_author(name=emb.author.name, icon_url=emb.author.icon_url)
     for name, value, inline in new_fields:
         new_emb.add_field(name=name, value=value, inline=inline)
     return new_emb
@@ -123,11 +152,16 @@ async def send_initial_message(handle, embed: discord.Embed) -> discord.Message:
     else:
         return await handle.send(embed=embed)
 
+# ---------------- Main response logic ----------------
 async def respond_with_ai(interaction_or_ctx, question: str) -> None:
     msg: discord.Message = None
     try:
-        base_embed = make_embed(question)
+        # identify asker and avatar
+        asker_name, asker_avatar = get_asker_identity(interaction_or_ctx)
+        base_embed = make_embed(question, asker_name, asker_avatar)
         msg = await send_initial_message(interaction_or_ctx, base_embed)
+
+        # Stream response
         stream = client.chat.completions.create(
             model=DEEPSEEK_MODEL,
             messages=[
@@ -140,9 +174,11 @@ async def respond_with_ai(interaction_or_ctx, question: str) -> None:
         last_edit = 0.0
         edit_every_n_tokens = 30
         min_edit_interval = 0.25
+
         async def iterate_chunks():
             for chunk in stream:
                 yield chunk
+
         async for chunk in iterate_chunks():
             try:
                 delta = getattr(chunk.choices[0].delta, "content", None)
@@ -158,6 +194,7 @@ async def respond_with_ai(interaction_or_ctx, question: str) -> None:
                     emb = update_embed_with_partial(base_embed, partial_text)
                     await msg.edit(embed=emb)
                     last_edit = now
+
         final_answer = "".join(partial_buf).strip() or "No answer returned."
         usage_text = None
         final_embed = update_embed_with_answer(base_embed, final_answer, usage_text)
@@ -176,6 +213,7 @@ async def respond_with_ai(interaction_or_ctx, question: str) -> None:
         except Exception:
             pass
 
+# ---------------- Slash & Prefix Commands ----------------
 @tree.command(name="ask", description="Ask the AI a question and get a reply.")
 @app_commands.describe(question="Your question or prompt")
 async def ask_slash(interaction: discord.Interaction, question: str) -> None:
