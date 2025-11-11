@@ -2,7 +2,7 @@
 import os
 import logging
 import asyncio
-from typing import Optional, List, Optional as Opt, Tuple
+from typing import Optional, List, Optional as Opt, Tuple, Dict
 
 import discord
 from discord import app_commands
@@ -17,6 +17,10 @@ DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
 # Optional: set SHOW_USAGE=1 to display token usage beneath the answer (final edit only)
 SHOW_USAGE = os.environ.get("SHOW_USAGE", "0") == "1"
+
+# Smooth typing feel (tweak via env, no redeploy)
+CHAR_RATE_MS = int(os.environ.get("CHAR_RATE_MS", "140"))       # edit cadence (ms)
+CHARS_PER_TICK = int(os.environ.get("CHARS_PER_TICK", "40"))    # characters revealed per tick
 
 GUILD_ID_RAW = os.environ.get("GUILD_ID")  # set to your server ID for instant sync
 GUILD_ID: Optional[int] = int(GUILD_ID_RAW) if GUILD_ID_RAW and GUILD_ID_RAW.isdigit() else None
@@ -92,19 +96,31 @@ def get_asker_identity(src) -> Tuple[str, Optional[str]]:
     return name, avatar_url
 
 def make_embed(question: str, asker_name: Optional[str], asker_avatar: Optional[str], answer_preview: str = "⏳ generating...") -> discord.Embed:
-    emb = discord.Embed(title="AI Response", color=discord.Color.blurple())
+    # No title – cleaner look
+    emb = discord.Embed(color=discord.Color.blurple())
     # Show the asker’s avatar and name at the top of the embed
     if asker_name:
         try:
             emb.set_author(name=f"{asker_name} asked", icon_url=asker_avatar if asker_avatar else discord.Embed.Empty)
         except Exception:
-            # Some environments may fail to set icon; continue without it
             emb.set_author(name=f"{asker_name} asked")
     for idx, qchunk in enumerate(chunk_text(question, EMBED_FIELD_LIMIT)):
         name = "Question" if idx == 0 else f"Question (cont. {idx})"
         emb.add_field(name=name, value=qchunk or "—", inline=False)
     emb.add_field(name="Answer", value=answer_preview, inline=False)
     return emb
+
+def _rebuild_embed_preserving_author(base: discord.Embed, color: discord.Color, fields: List[tuple]) -> discord.Embed:
+    new_emb = discord.Embed(color=color)  # still no title
+    # Preserve author (avatar/name)
+    try:
+        if base.author and base.author.name:
+            new_emb.set_author(name=base.author.name, icon_url=base.author.icon_url)
+    except Exception:
+        pass
+    for name, value, inline in fields:
+        new_emb.add_field(name=name, value=value, inline=inline)
+    return new_emb
 
 def update_embed_with_answer(emb: discord.Embed, answer: str, usage_text: Opt[str]) -> discord.Embed:
     # Trim total answer for embed safety
@@ -127,43 +143,32 @@ def update_embed_with_answer(emb: discord.Embed, answer: str, usage_text: Opt[st
     if usage_text:
         new_fields.append(("Usage", usage_text[:EMBED_FIELD_LIMIT], False))
 
-    # Rebuild embed (green = finished) and preserve the author (avatar/name)
-    new_emb = discord.Embed(title=emb.title, color=discord.Color.green())
-    try:
-        if emb.author and emb.author.name:
-            new_emb.set_author(name=emb.author.name, icon_url=emb.author.icon_url)
-    except Exception:
-        pass
-    for name, value, inline in new_fields:
-        new_emb.add_field(name=name, value=value, inline=inline)
-    return new_emb
+    # Final embed in green, author preserved, no title
+    return _rebuild_embed_preserving_author(emb, discord.Color.green(), new_fields)
 
-def update_embed_with_partial(emb: discord.Embed, partial: str) -> discord.Embed:
+def update_embed_with_partial(emb: discord.Embed, partial: str, show_cursor: bool = True) -> discord.Embed:
     """Update only the answer placeholder with a partial (streaming) value."""
     # Trim total for safety during streaming
     if len(partial) > ANSWER_TOTAL_LIMIT:
         partial = partial[:ANSWER_TOTAL_LIMIT].rstrip() + "\n…(truncated)"
+    if show_cursor:
+        partial = (partial + " ▋").rstrip()
+
     # Copy non-answer fields
     new_fields = []
     for f in emb.fields:
         if f.name.lower().startswith("answer"):
             continue
         new_fields.append((f.name, f.value, f.inline))
+
     # Add partial as answer fields
     achunks = chunk_text(partial, EMBED_FIELD_LIMIT)
     for i, chunk in enumerate(achunks):
         name = "Answer (streaming)" if i == 0 else f"Answer (cont. {i})"
         new_fields.append((name, chunk if chunk else "—", False))
-    new_emb = discord.Embed(title=emb.title, color=discord.Color.blurple())
-    # Preserve author (avatar/name)
-    try:
-        if emb.author and emb.author.name:
-            new_emb.set_author(name=emb.author.name, icon_url=emb.author.icon_url)
-    except Exception:
-        pass
-    for name, value, inline in new_fields:
-        new_emb.add_field(name=name, value=value, inline=inline)
-    return new_emb
+
+    # Streaming embed remains blue, author preserved, no title
+    return _rebuild_embed_preserving_author(emb, discord.Color.blurple(), new_fields)
 
 async def send_initial_message(handle, embed: discord.Embed) -> discord.Message:
     """Send a public message for either an Interaction or a Context and return it."""
@@ -174,59 +179,145 @@ async def send_initial_message(handle, embed: discord.Embed) -> discord.Message:
     else:
         return await handle.send(embed=embed)
 
-# ---------------- Response handler (with streaming) ----------------
-async def respond_with_ai(interaction_or_ctx, question: str) -> None:
-    """Posts the question immediately (embed with asker's avatar), streams the answer, then finalizes."""
-    msg: discord.Message = None
+# ---------------- Optional: webhook "fake user message" (cached) ----------------
+_webhook_cache: Dict[int, discord.Webhook] = {}
+
+async def get_or_create_channel_webhook(channel: discord.abc.GuildChannel) -> Optional[discord.Webhook]:
     try:
-        # Identify asker (name + avatar) and build the initial embed with their picture
-        asker_name, asker_avatar = get_asker_identity(interaction_or_ctx)
+        if not hasattr(channel, "create_webhook"):
+            return None
+        wh = _webhook_cache.get(channel.id)
+        if wh:
+            return wh
+        webhooks = await channel.webhooks()
+        for existing in webhooks:
+            if existing.name == "AI Relay" and existing.token:
+                _webhook_cache[channel.id] = existing
+                return existing
+        wh = await channel.create_webhook(name="AI Relay", reason="AI relay for question mirroring")
+        _webhook_cache[channel.id] = wh
+        return wh
+    except discord.Forbidden:
+        return None
+    except Exception as e:
+        log.warning("get_or_create_channel_webhook error: %s", e)
+        return None
 
-        # 1) Post initial embed with "generating..." and author avatar
-        base_embed = make_embed(question, asker_name, asker_avatar)
-        msg = await send_initial_message(interaction_or_ctx, base_embed)
+# ---------------- Smooth streaming machinery ----------------
+SENTINEL = object()
 
-        # 2) Start streaming DeepSeek response
-        stream = client.chat.completions.create(
-            model=DEEPSEEK_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": question},
-            ],
-            stream=True,
-        )
+async def smooth_typing_display(
+    msg: discord.Message,
+    base_embed: discord.Embed,
+    q: asyncio.Queue,
+) -> str:
+    """Consume text deltas from the queue and reveal them as smooth 'typing'. Returns final text."""
+    assembled: List[str] = []
+    shown_len = 0
+    done = False
 
-        partial_buf: List[str] = []
-        last_edit = 0.0  # time.monotonic() alternative via asyncio loop
-        edit_every_n_tokens = 30      # push an edit every ~30 deltas
-        min_edit_interval = 0.25      # at least 250ms between edits
+    async def keep_typing(ch):
+        while not done:
+            try:
+                await ch.trigger_typing()
+            except Exception:
+                pass
+            await asyncio.sleep(7)
 
-        # Iterate chunks (DeepSeek/OpenAI client streams synchronously; bridge via async generator)
-        async def iterate_chunks():
-            for chunk in stream:
-                yield chunk
+    typing_task = asyncio.create_task(keep_typing(msg.channel)) if msg.channel else None
 
-        async for chunk in iterate_chunks():
+    try:
+        while True:
+            # Drain queue quickly
+            while True:
+                try:
+                    item = q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if item is SENTINEL:
+                    done = True
+                else:
+                    assembled.append(item)
+
+            current = "".join(assembled)
+            target_len = min(len(current), shown_len + CHARS_PER_TICK)
+            if target_len > shown_len:
+                # micro-pause after punctuation for realism
+                if target_len < len(current):
+                    peek = current[target_len - 1:target_len]
+                    if peek in ".?!,;:":
+                        await asyncio.sleep(0.08)
+                partial = current[:target_len]
+                emb = update_embed_with_partial(base_embed, partial, show_cursor=not done)
+                try:
+                    await msg.edit(embed=emb)
+                except Exception:
+                    pass
+                shown_len = target_len
+
+            if done and shown_len >= len(current):
+                return current
+
+            await asyncio.sleep(CHAR_RATE_MS / 1000.0)
+    finally:
+        if typing_task:
+            typing_task.cancel()
+
+def _produce_stream_sync(model: str, system_prompt: str, question: str, put_func) -> None:
+    """Blocking producer that reads the DeepSeek stream and pushes deltas via put_func."""
+    stream = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": question},
+        ],
+        stream=True,
+    )
+    try:
+        for chunk in stream:
             try:
                 delta = getattr(chunk.choices[0].delta, "content", None)
             except Exception:
                 delta = None
-            if not delta:
-                continue
-            partial_buf.append(delta)
+            if delta:
+                put_func(delta)
+    finally:
+        put_func(SENTINEL)
 
-            # Throttle message edits
-            if len(partial_buf) % edit_every_n_tokens == 0:
-                now = asyncio.get_event_loop().time()
-                if now - last_edit >= min_edit_interval:
-                    partial_text = "".join(partial_buf).strip()
-                    emb = update_embed_with_partial(base_embed, partial_text)
-                    await msg.edit(embed=emb)
-                    last_edit = now
+# ---------------- Response handler (smooth streaming + avatar) ----------------
+async def respond_with_ai(interaction_or_ctx, question: str) -> None:
+    """Posts the question with user's avatar, streams the answer with a typed effect, then finalizes."""
+    try:
+        # Identify asker (name + avatar) and build the initial embed (no title)
+        asker_name, asker_avatar = get_asker_identity(interaction_or_ctx)
+        base_embed = make_embed(question, asker_name, asker_avatar)
 
-        # 3) Finalize with the full answer + optional usage
-        final_answer = "".join(partial_buf).strip() or "No answer returned."
-        usage_text = None  # streaming path: usage not reliably available
+        # Post initial embed
+        msg = await send_initial_message(interaction_or_ctx, base_embed)
+
+        # Prepare streaming queue & background producer
+        q: asyncio.Queue = asyncio.Queue()
+
+        def put_now(item):
+            loop = asyncio.get_running_loop()
+            loop.call_soon_threadsafe(q.put_nowait, item)
+
+        producer_task = asyncio.create_task(
+            asyncio.to_thread(_produce_stream_sync, DEEPSEEK_MODEL, SYSTEM_PROMPT, question, put_now)
+        )
+
+        # Smooth typed display
+        final_text = await smooth_typing_display(msg, base_embed, q)
+
+        # Ensure producer completed
+        try:
+            await producer_task
+        except Exception as pe:
+            log.exception("Producer thread failed: %s", pe)
+
+        # Finalize (green, still no title)
+        final_answer = final_text.strip() or "No answer returned."
+        usage_text = None  # streaming usage is typically unavailable
         final_embed = update_embed_with_answer(base_embed, final_answer, usage_text)
         await msg.edit(embed=final_embed)
 
@@ -275,7 +366,6 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @bot.event
 async def on_ready() -> None:
     try:
-        # Sync globally and, if provided, to a specific guild for instant availability
         if GUILD_ID:
             guild_obj = discord.Object(id=GUILD_ID)
             tree.copy_global_to(guild=guild_obj)
